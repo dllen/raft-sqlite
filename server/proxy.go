@@ -417,6 +417,14 @@ func (p *ProxyLayer) GetAvailableRebalanceAlgorithms() []string {
 	return algs
 }
 
+// GetDefaultRebalanceAlgorithm returns the name of the default rebalance algorithm
+func (p *ProxyLayer) GetDefaultRebalanceAlgorithm() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.defaultRebalanceAlg
+}
+
 // AutoRebalance periodically checks and rebalances shards
 func (p *ProxyLayer) AutoRebalance() {
 	p.mu.RLock()

@@ -252,6 +252,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/table/remove", s.handleRemoveTable)
 	mux.HandleFunc("/table/add-to-shard", s.handleAddTableToShard)
 	mux.HandleFunc("/table/rebalance", s.handleRebalanceTable)
+	mux.HandleFunc("/rebalance/algorithms", s.handleListRebalanceAlgorithms)
 
 	return mux
 }
@@ -735,7 +736,8 @@ func (s *Server) handleRebalanceTable(w http.ResponseWriter, r *http.Request) {
 
 	// Parse the request body
 	var request struct {
-		TableName string `json:"table_name"`
+		TableName     string `json:"table_name"`
+		AlgorithmName string `json:"algorithm_name,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -773,4 +775,31 @@ func (s *Server) handleRebalanceTable(w http.ResponseWriter, r *http.Request) {
 	// Return success
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Table %s rebalanced successfully", request.TableName)
+}
+
+// handleListRebalanceAlgorithms handles listing available rebalance algorithms
+func (s *Server) handleListRebalanceAlgorithms(w http.ResponseWriter, r *http.Request) {
+	// Only accept GET requests
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get available algorithms
+	algorithms := s.proxy.GetAvailableRebalanceAlgorithms()
+	defaultAlg := s.proxy.GetDefaultRebalanceAlgorithm()
+
+	// Prepare response
+	response := struct {
+		Algorithms     []string `json:"algorithms"`
+		DefaultAlgorithm string  `json:"default_algorithm"`
+	}{
+		Algorithms:     algorithms,
+		DefaultAlgorithm: defaultAlg,
+	}
+
+	// Return JSON response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
 }
