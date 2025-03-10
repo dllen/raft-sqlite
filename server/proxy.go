@@ -425,6 +425,40 @@ func (p *ProxyLayer) GetDefaultRebalanceAlgorithm() string {
 	return p.defaultRebalanceAlg
 }
 
+// GetTableInfo returns a copy of the table information
+func (p *ProxyLayer) GetTableInfo() map[string]TableInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// Create a copy of the tables map
+	tablesCopy := make(map[string]TableInfo, len(p.tables))
+	for name, info := range p.tables {
+		tablesCopy[name] = info
+	}
+
+	return tablesCopy
+}
+
+// GetShardMappings returns a copy of the shard mappings
+func (p *ProxyLayer) GetShardMappings() map[string]ShardMapping {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// Create a copy of the shard mappings map
+	mappingsCopy := make(map[string]ShardMapping, len(p.shardMappings))
+	for name, mapping := range p.shardMappings {
+		// Create a deep copy of the mapping
+		newMapping := ShardMapping{
+			TableName: mapping.TableName,
+			Shards:    make([]string, len(mapping.Shards)),
+		}
+		copy(newMapping.Shards, mapping.Shards)
+		mappingsCopy[name] = newMapping
+	}
+
+	return mappingsCopy
+}
+
 // AutoRebalance periodically checks and rebalances shards
 func (p *ProxyLayer) AutoRebalance() {
 	p.mu.RLock()

@@ -233,6 +233,81 @@ func (s *Server) Join(leaderAddr string) error {
 		return fmt.Errorf("failed to join cluster: %s", string(body))
 	}
 
+	// Process metadata from the leader
+	var metadata map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+		return fmt.Errorf("failed to decode metadata: %s", err)
+	}
+
+	// Synchronize tables and shard mappings
+	if err := s.syncMetadataFromLeader(metadata); err != nil {
+		return fmt.Errorf("failed to sync metadata: %s", err)
+	}
+
+	return nil
+}
+
+// syncMetadataFromLeader synchronizes metadata from the leader
+func (s *Server) syncMetadataFromLeader(metadata map[string]interface{}) error {
+	// Ensure proxy layer is initialized
+	if s.proxy == nil {
+		return fmt.Errorf("proxy layer not initialized")
+	}
+
+	// Process table information
+	tablesData, ok := metadata["tables"].(map[string]interface{})
+	if ok {
+		for _, tableDataRaw := range tablesData {
+			tableData, ok := tableDataRaw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// Extract table info
+			name, _ := tableData["Name"].(string)
+			shardKey, _ := tableData["ShardKey"].(string)
+			shardFunc, _ := tableData["ShardFunc"].(string)
+
+			// Register table locally
+			if err := s.proxy.RegisterTable(name, shardKey, shardFunc); err != nil {
+				log.Printf("Error registering table %s: %s", name, err)
+			}
+		}
+	}
+
+	// Process shard mappings
+	mappingsData, ok := metadata["shardMappings"].(map[string]interface{})
+	if ok {
+		for tableName, mappingDataRaw := range mappingsData {
+			mappingData, ok := mappingDataRaw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// Extract shard mapping
+			shardsRaw, ok := mappingData["Shards"].([]interface{})
+			if !ok {
+				continue
+			}
+
+			// Convert shards to string slice
+			shards := make([]string, 0, len(shardsRaw))
+			for _, shardRaw := range shardsRaw {
+				shardID, ok := shardRaw.(string)
+				if ok {
+					shards = append(shards, shardID)
+				}
+			}
+
+			// Add table to each shard
+			for _, shardID := range shards {
+				if err := s.proxy.AddTableToShard(tableName, shardID); err != nil {
+					log.Printf("Error adding table %s to shard %s: %s", tableName, shardID, err)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -312,7 +387,16 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Prepare metadata for synchronization
+	metadata := map[string]interface{}{
+		"tables":        s.proxy.GetTableInfo(),
+		"shardMappings": s.proxy.GetShardMappings(),
+	}
+
+	// Return metadata along with OK status
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(metadata)
 }
 
 // handleExecute handles SQL execution requests

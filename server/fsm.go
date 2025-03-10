@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"sync"
@@ -122,29 +123,11 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	// In a sharded environment, we need to create snapshots for all shards
-	// For simplicity, we'll just snapshot the default database for now
-	// In a production system, you would need to handle snapshots for all shards
-	var db *sql.DB
-	if f.server != nil && len(f.server.shards) > 0 {
-		// Get the first shard for snapshot
-		for _, shard := range f.server.shards {
-			db = shard.DB
-			break
-		}
-	} else {
-		db = f.db
-	}
-
-	// Create a read-only transaction
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	// Create a snapshot
-	return &Snapshot{tx: tx}, nil
+	// Create a snapshot with references to server and FSM
+	return &Snapshot{
+		server: f.server,
+		fsm:    f,
+	}, nil
 }
 
 // Restore restores the SQLite database from a snapshot
@@ -152,61 +135,161 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// In a sharded environment, we need to restore all shards
-	// For simplicity, we'll just restore the default database for now
-	if f.server != nil && len(f.server.shards) > 0 {
-		// Close all shard connections
+	// Read the snapshot data
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return fmt.Errorf("failed to read snapshot data: %s", err)
+	}
+
+	// Parse the snapshot data
+	type ShardData struct {
+		ID   string `json:"id"`
+		Path string `json:"path"`
+		Data []byte `json:"data"`
+	}
+
+	type SnapshotData struct {
+		Shards        []ShardData              `json:"shards"`
+		Tables        map[string]TableInfo     `json:"tables"`
+		ShardMappings map[string]ShardMapping  `json:"shard_mappings"`
+	}
+
+	var snapshotData SnapshotData
+	if err := json.Unmarshal(data, &snapshotData); err != nil {
+		return fmt.Errorf("failed to parse snapshot data: %s", err)
+	}
+
+	// Close all existing shard connections
+	if f.server != nil {
 		for _, shard := range f.server.shards {
 			if shard.DB != nil {
 				if err := shard.DB.Close(); err != nil {
 					f.logger.Printf("Error closing shard %s: %s", shard.ID, err)
 				}
 			}
-
-			// Reopen the shard database
-			db, err := sql.Open("sqlite3", shard.Path)
-			if err != nil {
-				f.logger.Printf("Error reopening shard %s: %s", shard.ID, err)
-				continue
-			}
-			shard.DB = db
 		}
-	} else {
+	} else if f.db != nil {
 		// Close the existing database
 		if err := f.db.Close(); err != nil {
-			return err
+			return fmt.Errorf("error closing main database: %s", err)
 		}
+	}
 
-		// Reopen the database with the same connection string
+	// Restore shards
+	if f.server != nil {
+		// Clear existing shards
+		f.server.mu.Lock()
+		f.server.shards = make(map[string]*Shard)
+
+		// Restore each shard
+		for _, shardData := range snapshotData.Shards {
+			// In a real implementation, you would restore the database from the data
+			// For now, we'll just reopen the database at the same path
+			shard, err := NewShard(shardData.ID, shardData.Path)
+			if err != nil {
+				f.logger.Printf("Error restoring shard %s: %s", shardData.ID, err)
+				continue
+			}
+			f.server.shards[shardData.ID] = shard
+		}
+		f.server.mu.Unlock()
+
+		// Restore tables and shard mappings
+		if f.server.proxy != nil {
+			// Clear existing tables and mappings
+			f.server.proxy.mu.Lock()
+			f.server.proxy.tables = make(map[string]TableInfo)
+			f.server.proxy.shardMappings = make(map[string]ShardMapping)
+
+			// Restore tables
+			for name, info := range snapshotData.Tables {
+				f.server.proxy.tables[name] = info
+			}
+
+			// Restore shard mappings
+			for name, mapping := range snapshotData.ShardMappings {
+				f.server.proxy.shardMappings[name] = mapping
+			}
+			f.server.proxy.mu.Unlock()
+		}
+	} else {
+		// Reopen the main database
 		db, err := sql.Open("sqlite3", f.dbPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("error reopening main database: %s", err)
 		}
 		f.db = db
 	}
 
-	// Read the snapshot data and restore the database
-	// This is a simplified implementation; in a real system,
-	// you would need to handle the actual restoration of the database
-	// from the snapshot data
+	f.logger.Printf("Restored %d shards, %d tables, and %d mappings from snapshot", 
+		len(snapshotData.Shards), len(snapshotData.Tables), len(snapshotData.ShardMappings))
 	return nil
 }
 
 // Snapshot is a Raft FSM snapshot implementation for SQLite
 type Snapshot struct {
-	tx *sql.Tx
+	server *Server
+	fsm    *FSM
 }
 
 // Persist persists the snapshot to the given sink
 func (s *Snapshot) Persist(sink raft.SnapshotSink) error {
 	defer sink.Close()
 
-	// In a real implementation, you would dump the database to the sink
-	// This is a simplified implementation
-	_, err := sink.Write([]byte("snapshot"))
+	// Create a snapshot of all shards and metadata
+	if s.server == nil {
+		return fmt.Errorf("server reference is nil")
+	}
+
+	// Create a snapshot structure to serialize
+	type ShardData struct {
+		ID   string `json:"id"`
+		Path string `json:"path"`
+		Data []byte `json:"data"`
+	}
+
+	type SnapshotData struct {
+		Shards       []ShardData                  `json:"shards"`
+		Tables       map[string]TableInfo         `json:"tables"`
+		ShardMappings map[string]ShardMapping     `json:"shard_mappings"`
+	}
+
+	// Lock the server to ensure consistent state
+	s.server.mu.RLock()
+	defer s.server.mu.RUnlock()
+
+	// Prepare snapshot data
+	snapshotData := SnapshotData{
+		Shards:        make([]ShardData, 0, len(s.server.shards)),
+		Tables:        s.server.proxy.GetTableInfo(),
+		ShardMappings: s.server.proxy.GetShardMappings(),
+	}
+
+	// Add each shard's data
+	for id, shard := range s.server.shards {
+		// For each shard, we need to dump its database
+		// In a real implementation, you would use sqlite3's backup API
+		// For simplicity, we'll just include the path and ID
+		shardData := ShardData{
+			ID:   id,
+			Path: shard.Path,
+			// In a real implementation, you would include the actual database content
+			Data: []byte{}, // Placeholder for actual database dump
+		}
+		snapshotData.Shards = append(snapshotData.Shards, shardData)
+	}
+
+	// Serialize the snapshot data
+	data, err := json.Marshal(snapshotData)
 	if err != nil {
 		sink.Cancel()
-		return err
+		return fmt.Errorf("failed to serialize snapshot: %s", err)
+	}
+
+	// Write the serialized data to the sink
+	if _, err := sink.Write(data); err != nil {
+		sink.Cancel()
+		return fmt.Errorf("failed to write snapshot: %s", err)
 	}
 
 	return nil
@@ -214,5 +297,5 @@ func (s *Snapshot) Persist(sink raft.SnapshotSink) error {
 
 // Release releases resources associated with the snapshot
 func (s *Snapshot) Release() {
-	s.tx.Rollback()
+	// No resources to release in our implementation
 }
